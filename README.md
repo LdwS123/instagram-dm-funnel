@@ -62,6 +62,7 @@ In `wrangler.toml`, set `COMPOSIO_USER_ID` to the user id from step 1.
 npx wrangler login                        # opens your browser
 npx wrangler kv namespace create STATE    # copy the printed id into wrangler.toml
 npx wrangler secret put COMPOSIO_API_KEY  # paste your Composio API key
+npx wrangler secret put ADMIN_KEY         # any long random string — unlocks /admin
 npx wrangler deploy
 ```
 
@@ -70,6 +71,18 @@ npx wrangler deploy
 - Open `https://<your-worker>.workers.dev/gate-check` → you want `"graph_token_recovered": true`
 - Open `https://<your-worker>.workers.dev` → the live dashboard
 - From another account, comment your keyword on a recent reel → the DM lands within ~20s, the button answers in ~5s
+
+## Admin UI — edit everything in the browser
+
+Open `https://<your-worker>.workers.dev/admin` to edit your campaigns (keywords, links, DM copy), button labels and follow-gate messages **without touching code or redeploying** — changes go live in ~15 seconds.
+
+Protect it first (required — anyone with the key can change your links):
+
+```bash
+npx wrangler secret put ADMIN_KEY   # pick a long random value
+```
+
+Enter that key once on the /admin page; it's stored only in your browser.
 
 ## Configuration reference
 

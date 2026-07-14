@@ -51,3 +51,8 @@ RECHECK_PER_RUN = "3"
 # key with "proxy execute" enabled, plus your connected account id (ca_…):
 #   npx wrangler secret put COMPOSIO_PROXY_API_KEY
 # CONNECTED_ACCOUNT_ID = "ca_XXXXXXXXXXXX"
+
+# ── Admin UI ────────────────────────────────────────────────────────────────
+# Edit campaigns, links and message copy in the browser at /admin — changes
+# go live in ~15s, no redeploy. Protect it with a secret key (required):
+#   npx wrangler secret put ADMIN_KEY

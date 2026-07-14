@@ -23,7 +23,7 @@
  * fallback transport. With neither available the bot degrades gracefully to
  * the old behavior: keyword comment → link DM'd immediately.
  *
- * To add a new partnership: push a new entry to CAMPAIGNS and redeploy.
+ * To add or edit campaigns / copy: open /admin on the worker URL (no redeploy).
  */
 
 const TOOLS_URL = 'https://backend.composio.dev/api/v3/tools/execute';
@@ -104,9 +104,66 @@ const CAMPAIGNS: Campaign[] = [
   },
 ];
 
+// ── Editable config (admin UI at /admin) ───────────────────────────────────
+// Everything above (handle, button labels, gate copy, campaigns) is only the
+// DEFAULT. The live values are read from KV key `config`, editable in the
+// browser at /admin (protected by the ADMIN_KEY secret) — no redeploy needed.
+type FunnelConfig = {
+  myHandle: string;
+  myProfileUrl: string;
+  btnTitle: string;
+  followBtnTitle: string;
+  gateDm: string;
+  gateNudge: string;
+  campaigns: Campaign[];
+};
+
+const DEFAULT_CONFIG: FunnelConfig = {
+  myHandle: MY_HANDLE,
+  myProfileUrl: MY_PROFILE_URL,
+  btnTitle: BTN_TITLE,
+  followBtnTitle: FOLLOW_BTN_TITLE,
+  gateDm: GATE_DM_DEFAULT,
+  gateNudge: GATE_NUDGE,
+  campaigns: CAMPAIGNS,
+};
+
+// Live config, refreshed from KV at most every 15s (module state survives
+// across invocations in a warm isolate, so this is nearly always warm).
+let CFG: FunnelConfig = DEFAULT_CONFIG;
+let cfgLoadedAt = 0;
+
+async function loadFunnelConfig(env: Env): Promise<void> {
+  if (Date.now() - cfgLoadedAt < 15000) return;
+  cfgLoadedAt = Date.now();
+  try {
+    const raw = await env.STATE.get('config');
+    if (!raw) { CFG = DEFAULT_CONFIG; return; }
+    const j = JSON.parse(raw);
+    CFG = {
+      ...DEFAULT_CONFIG,
+      ...j,
+      campaigns: Array.isArray(j.campaigns) && j.campaigns.length ? j.campaigns : DEFAULT_CONFIG.campaigns,
+    };
+  } catch {
+    CFG = DEFAULT_CONFIG;
+  }
+}
+
+// Campaign colors for the dashboard — assigned by position, so custom
+// campaigns added in /admin get a color automatically.
+const PALETTE = ['#7c3aed', '#0a66ff', '#0f9d58', '#e37400', '#d81b60', '#00897b'];
+function campaignColor(name?: string): string {
+  const idx = CFG.campaigns.findIndex((c) => c.name === name);
+  return PALETTE[(idx >= 0 ? idx : 0) % PALETTE.length];
+}
+
 interface Env {
   STATE: KVNamespace;
   COMPOSIO_API_KEY: string;
+  // Secret protecting the /admin page — set it once with:
+  //   npx wrangler secret put ADMIN_KEY
+  ADMIN_KEY?: string;
   COMPOSIO_USER_ID?: string;
   MAX_PER_HOUR?: string;
   PER_RUN_CAP?: string;
@@ -386,7 +443,7 @@ async function sendButtonDm(
 }
 
 function gateDmText(campaign: Campaign): string {
-  return (campaign.gateDmTemplate || GATE_DM_DEFAULT).replace('{keyword}', campaign.keyword);
+  return (campaign.gateDmTemplate || CFG.gateDm).replace('{keyword}', campaign.keyword);
 }
 
 function pickFrom(pool: string[]): string {
@@ -398,13 +455,30 @@ function pickFrom(pool: string[]): string {
 // which literally contains "build") never triggers a false match.
 function findCampaign(text: string): Campaign | undefined {
   const cleaned = text.replace(/@[\w.]+/g, ' ').toLowerCase();
-  return CAMPAIGNS.find((c) => cleaned.includes(c.keyword.toLowerCase()));
+  return CFG.campaigns.find((c) => cleaned.includes(c.keyword.toLowerCase()));
+}
+
+// KV write that can't crash the funnel. Returns false on failure (e.g. the
+// free plan's 1,000 writes/day quota) — callers use that to SKIP side effects
+// that must never happen without their dedupe marker being persisted first.
+async function kvPutSafe(env: Env, key: string, value: string, opts?: { expirationTtl?: number }): Promise<boolean> {
+  try {
+    await env.STATE.put(key, value, opts);
+    return true;
+  } catch (e) {
+    console.log('KV put failed', key, (e as Error).message);
+    return false;
+  }
 }
 
 async function pushLog(env: Env, entry: Entry) {
-  const log: Entry[] = JSON.parse((await env.STATE.get('log')) || '[]');
-  log.unshift(entry);
-  await env.STATE.put('log', JSON.stringify(log.slice(0, 500)));
+  try {
+    const log: Entry[] = JSON.parse((await env.STATE.get('log')) || '[]');
+    log.unshift(entry);
+    await env.STATE.put('log', JSON.stringify(log.slice(0, 500)));
+  } catch (e) {
+    console.log('pushLog failed', (e as Error).message);
+  }
 }
 
 // Shared hourly budget across all DM types (hook, gate, link).
@@ -412,13 +486,13 @@ type HourBudget = { key: string; count: number };
 
 async function bumpHour(env: Env, h: HourBudget) {
   h.count++;
-  await env.STATE.put(h.key, String(h.count), { expirationTtl: 7200 });
+  await kvPutSafe(env, h.key, String(h.count), { expirationTtl: 7200 });
 }
 
-async function saveAwaiting(env: Env, aw: Awaiting) {
+async function saveAwaiting(env: Env, aw: Awaiting): Promise<boolean> {
   // KV can't extend TTL in place — re-put with whatever remains of the 7-day window.
   const remaining = Math.max(60, Math.floor((new Date(aw.at).getTime() + 7 * 86400000 - Date.now()) / 1000));
-  await env.STATE.put(`awaiting:${aw.from_id}`, JSON.stringify(aw), { expirationTtl: remaining });
+  return kvPutSafe(env, `awaiting:${aw.from_id}`, JSON.stringify(aw), { expirationTtl: remaining });
 }
 
 // Deliver the campaign link (funnel finish line) and clean up state.
@@ -430,7 +504,7 @@ async function deliverLink(
   aw: Awaiting,
   followCheck: Entry['follow_check']
 ): Promise<void> {
-  const campaign = CAMPAIGNS.find((x) => x.name === aw.campaign) || CAMPAIGNS[0];
+  const campaign = CFG.campaigns.find((x) => x.name === aw.campaign) || CFG.campaigns[0];
   const dmText = campaign.dmTemplate.replace('{link}', campaign.link);
   const res = await sendButtonDm(
     env,
@@ -454,7 +528,11 @@ async function deliverLink(
     follow_check: followCheck,
   });
   if (res.ok) {
-    await env.STATE.delete(`awaiting:${aw.from_id}`);
+    try {
+      await env.STATE.delete(`awaiting:${aw.from_id}`);
+    } catch (e) {
+      console.log('awaiting delete failed', (e as Error).message);
+    }
     await bumpHour(env, h);
   }
 }
@@ -466,6 +544,7 @@ async function loadHour(env: Env): Promise<HourBudget> {
 
 // ── Click poll: button taps only — ONE API call, runs every ~2.5s ──────────
 async function pollClicks(env: Env): Promise<number> {
+  await loadFunnelConfig(env);
   const c = cfg(env);
   const h = await loadHour(env);
   return handleClicks(env, c, h);
@@ -475,6 +554,7 @@ async function pollClicks(env: Env): Promise<number> {
 // Heavier (~8 API calls), runs every ~18s — in the BACKGROUND, so it never
 // delays a click response.
 async function pollScan(env: Env): Promise<{ handled: number; matched: number; unlocked: number; error?: string }> {
+  await loadFunnelConfig(env);
   const c = cfg(env);
   const h = await loadHour(env);
 
@@ -519,6 +599,9 @@ async function pollScan(env: Env): Promise<{ handled: number; matched: number; u
 
         matched++;
         if (await env.STATE.get(`seen:${id}`)) continue;
+        // Mark the comment handled BEFORE messaging anyone: if this write
+        // fails (KV daily quota), skipping beats re-DMing them every scan.
+        if (!(await kvPutSafe(env, `seen:${id}`, '1', { expirationTtl: 60 * 86400 }))) continue;
 
         const fromId: string | undefined = cm?.from_user?.id;
         const fromName: string = cm?.from_user?.username || 'unknown';
@@ -547,7 +630,7 @@ async function pollScan(env: Env): Promise<{ handled: number; matched: number; u
           entry.dm_error = 'no recipient on comment';
         } else {
           const res = await sendButtonDm(env, { userId: fromId, commentId: id }, campaign.hookDm, [
-            { title: BTN_TITLE },
+            { title: CFG.btnTitle },
           ]);
           entry.dm_status = res.ok ? 'sent' : 'failed';
           entry.dm_error = res.error;
@@ -575,10 +658,9 @@ async function pollScan(env: Env): Promise<{ handled: number; matched: number; u
             at: entry.at,
             stage: 'hook',
           };
-          await env.STATE.put(`awaiting:${fromId}`, JSON.stringify(aw), { expirationTtl: 7 * 86400 });
+          await kvPutSafe(env, `awaiting:${fromId}`, JSON.stringify(aw), { expirationTtl: 7 * 86400 });
         }
 
-        await env.STATE.put(`seen:${id}`, '1', { expirationTtl: 60 * 86400 });
         await pushLog(env, entry);
         if (entry.dm_status === 'sent') await bumpHour(env, h);
         handled++;
@@ -614,6 +696,10 @@ async function poll(env: Env): Promise<{ handled: number; matched: number; click
 // A quick-reply tap arrives as a normal message from the user, so polling the
 // conversation feed catches it. Any message from someone in the funnel counts
 // (people often type "yes"/"link" instead of tapping — same intent).
+
+// Last successful conversation sweep (module memory — see comment in the
+// function; deliberately NOT in KV).
+let lastSweepMem = 0;
 async function handleClicks(env: Env, c: ReturnType<typeof cfg>, h: HourBudget): Promise<number> {
   const inFunnel = await env.STATE.list({ prefix: 'awaiting:', limit: 1 });
   if (inFunnel.keys.length === 0) return 0;
@@ -625,8 +711,10 @@ async function handleClicks(env: Env, c: ReturnType<typeof cfg>, h: HourBudget):
   }
 
   // Only look at conversations that moved since the last sweep (90s margin —
-  // ticks overlap is fine, msgseen dedupes).
-  const lastSweep = Number(await env.STATE.get('convcursor')) || Date.now() - 3600000;
+  // ticks overlap is fine, msgseen dedupes). Kept in MEMORY, not KV: this runs
+  // ~20x/min and KV's free plan only allows 1,000 writes per DAY. A cold
+  // isolate just re-inspects the last hour; msgseen dedupes the overlap.
+  const lastSweep = lastSweepMem || Date.now() - 3600000;
   const cutoff = lastSweep - 90000;
   let acted = 0;
   let capped = false;
@@ -671,7 +759,9 @@ async function handleClicks(env: Env, c: ReturnType<typeof cfg>, h: HourBudget):
       const sentAt = m?.created_time ? new Date(m.created_time).getTime() : 0;
       if (sentAt <= new Date(aw.at).getTime()) continue;         // predates the funnel
       if (await env.STATE.get(`msgseen:${m.id}`)) continue;
-      await env.STATE.put(`msgseen:${m.id}`, '1', { expirationTtl: 3 * 86400 });
+      // Dedupe marker MUST be persisted before we act — if KV writes are down
+      // (daily quota), skip rather than risk answering the same tap forever.
+      if (!(await kvPutSafe(env, `msgseen:${m.id}`, '1', { expirationTtl: 3 * 86400 }))) continue;
 
       // The click. Follower → link. Not following → gate (with the button again).
       let follows: boolean | null = null;
@@ -695,11 +785,11 @@ async function handleClicks(env: Env, c: ReturnType<typeof cfg>, h: HourBudget):
         // following → short nudge. Both rate-limited so rapid taps don't spam.
         const sinceGate = aw.lastGateAt ? Date.now() - new Date(aw.lastGateAt).getTime() : Infinity;
         if (sinceGate >= GATE_RESEND_MS) {
-          const campaign = CAMPAIGNS.find((x) => x.name === aw.campaign) || CAMPAIGNS[0];
-          const gateText = aw.stage === 'gated' ? GATE_NUDGE : gateDmText(campaign);
+          const campaign = CFG.campaigns.find((x) => x.name === aw.campaign) || CFG.campaigns[0];
+          const gateText = aw.stage === 'gated' ? CFG.gateNudge : gateDmText(campaign);
           const res = await sendButtonDm(env, { userId: fromId }, gateText, [
             { title: FOLLOW_BTN_TITLE, url: MY_PROFILE_URL },
-            { title: BTN_TITLE },
+            { title: CFG.btnTitle },
           ]);
           aw.stage = 'gated';
           aw.lastGateAt = new Date().toISOString();
@@ -727,7 +817,7 @@ async function handleClicks(env: Env, c: ReturnType<typeof cfg>, h: HourBudget):
 
   // If the hourly cap cut the sweep short, keep the cursor where it was so
   // unprocessed taps are retried next tick instead of silently skipped.
-  if (!capped) await env.STATE.put('convcursor', String(Date.now()));
+  if (!capped) lastSweepMem = Date.now();
   return acted;
 }
 
@@ -752,16 +842,18 @@ async function recheckGated(env: Env, c: ReturnType<typeof cfg>, h: HourBudget):
     if (aw.lastCheck && Date.now() - new Date(aw.lastCheck).getTime() < RECHECK_COOLDOWN_MS) continue;
 
     checked++;
+    // Stamp the attempt BEFORE doing anything: if this write fails (KV daily
+    // quota), skip — otherwise a failed cleanup later would re-send the link
+    // to the same person every minute.
+    aw.lastCheck = new Date().toISOString();
+    if (!(await saveAwaiting(env, aw))) continue;
+
     const res = await checkFollows(env, aw.from_id);
-    if (res.follows !== true) {
-      aw.lastCheck = new Date().toISOString();
-      await saveAwaiting(env, aw);
-      continue;
-    }
+    if (res.follows !== true) continue;
 
     // They followed → unlock. The messaging window is open (they messaged us
     // at the gate step), so the link DM goes straight through.
-    await env.STATE.put(`follower:${aw.from_id}`, '1', { expirationTtl: 30 * 86400 });
+    await kvPutSafe(env, `follower:${aw.from_id}`, '1', { expirationTtl: 30 * 86400 });
     await deliverLink(env, h, aw, 'follows');
     delivered++;
   }
@@ -772,12 +864,6 @@ async function recheckGated(env: Env, c: ReturnType<typeof cfg>, h: HourBudget):
 function escapeHtml(s: string): string {
   return (s || '').replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch] as string));
 }
-
-// Distinct color per campaign so they're visually obvious on the dashboard.
-const CAMPAIGN_COLORS: Record<string, string> = {
-  Emergent: '#7c3aed',  // purple
-  Krater: '#0a66ff',    // blue
-};
 
 function dashboard(log: Entry[]): string {
   // Pre-funnel entries (no `step`) were direct link sends — count them as links.
@@ -790,10 +876,10 @@ function dashboard(log: Entry[]): string {
 
   // Pre-multi-campaign entries have no `campaign` field; they were all Emergent,
   // so fold them under the first campaign. Same logic in camBadge below.
-  const tagOf = (e: Entry) => e.campaign || CAMPAIGNS[0].name;
-  const perCampaign = CAMPAIGNS.map((c) => {
+  const tagOf = (e: Entry) => e.campaign || CFG.campaigns[0].name;
+  const perCampaign = CFG.campaigns.map((c) => {
     const n = log.filter((e) => tagOf(e) === c.name && stepOf(e) === 'link' && e.dm_status === 'sent').length;
-    const col = CAMPAIGN_COLORS[c.name] || '#7c3aed';
+    const col = campaignColor(c.name);
     return `<div class="stat" style="border-left:4px solid ${col}"><div class="v">${n}</div><div class="k">${escapeHtml(c.name)} · "${escapeHtml(c.keyword)}"</div></div>`;
   }).join('');
 
@@ -843,11 +929,11 @@ function dashboard(log: Entry[]): string {
 
   function camBadge(name?: string) {
     if (!name) return '';
-    const col = CAMPAIGN_COLORS[name] || '#7c3aed';
+    const col = campaignColor(name);
     return `<span class="cam" style="background:${col}20;color:${col}">${escapeHtml(name)}</span>`;
   }
 
-  const campaignsList = CAMPAIGNS.map((c) => `"${c.keyword}" → ${c.name}`).join(' · ');
+  const campaignsList = CFG.campaigns.map((c) => `"${c.keyword}" → ${c.name}`).join(' · ');
 
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Comment → DM funnel</title>
 <style>
@@ -871,8 +957,8 @@ function dashboard(log: Entry[]): string {
   .badge{font-size:11px;font-weight:700;padding:2px 9px;border-radius:99px}.b-green{background:#e6f7ee;color:var(--green)}.b-red{background:#fdecec;color:var(--red)}.b-muted{background:#eef0f3;color:var(--muted)}.b-amber{background:#fdf3e0;color:#b45309}.b-purple{background:#f3e8ff;color:#7c3aed}
   .empty{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:40px;text-align:center;color:var(--muted)}
 </style></head><body>
-<h1>🚀 Comment → DM funnel <span style="font-size:13px;color:#7c3aed;font-weight:600">· instant (~15s)</span></h1>
-<div class="sub">Cloudflare Worker · ${CAMPAIGNS.length} campaign${CAMPAIGNS.length > 1 ? 's' : ''}: ${escapeHtml(campaignsList)} · flow: comment → 📩 button → 🔒 follow gate → 🔗 link</div>
+<h1>🚀 Comment → DM funnel <span style="font-size:13px;color:#7c3aed;font-weight:600">· instant (~15s)</span> <a href="/admin" style="float:right;font-size:13px;font-weight:600">⚙️ settings</a></h1>
+<div class="sub">Cloudflare Worker · ${CFG.campaigns.length} campaign${CFG.campaigns.length > 1 ? 's' : ''}: ${escapeHtml(campaignsList)} · flow: comment → 📩 button → 🔒 follow gate → 🔗 link</div>
 <div class="stats">
   <div class="stat feature"><div class="v">${links}</div><div class="k">🔗 Links delivered</div></div>
   ${perCampaign}
@@ -888,6 +974,138 @@ setTimeout(()=>location.reload(),60000);
 </script>
 </body></html>`;
 }
+
+// ── Admin UI: edit campaigns / links / copy in the browser, no redeploy ────
+function adminAuthorized(request: Request, env: Env): boolean {
+  if (!env.ADMIN_KEY) return false;
+  return request.headers.get('x-admin-key') === env.ADMIN_KEY;
+}
+
+// Validate + normalize a config payload coming from the admin form.
+function sanitizeConfig(input: any): FunnelConfig | { error: string } {
+  const str = (v: any, max: number, fallback = '') => (typeof v === 'string' ? v.slice(0, max).trim() : fallback);
+  const campaigns: Campaign[] = [];
+  if (!Array.isArray(input?.campaigns) || input.campaigns.length === 0) return { error: 'at least one campaign required' };
+  if (input.campaigns.length > 10) return { error: 'max 10 campaigns' };
+  for (const c of input.campaigns) {
+    const name = str(c?.name, 40);
+    const keyword = str(c?.keyword, 40).toLowerCase();
+    const link = str(c?.link, 500);
+    if (!name || !keyword) return { error: 'each campaign needs a name and a keyword' };
+    if (!/^https:\/\//.test(link)) return { error: `campaign "${name}": link must start with https://` };
+    const publicReplies = (Array.isArray(c?.publicReplies) ? c.publicReplies : String(c?.publicReplies || '').split('|'))
+      .map((s: any) => String(s).slice(0, 200).trim())
+      .filter(Boolean)
+      .slice(0, 8);
+    campaigns.push({
+      name,
+      keyword,
+      link,
+      hookDm: str(c?.hookDm, 640) || DEFAULT_CONFIG.campaigns[0].hookDm,
+      dmTemplate: str(c?.dmTemplate, 900) || `here it is 🤝 {link}`,
+      linkCardText: str(c?.linkCardText, 640) || str(c?.dmTemplate, 640) || 'here it is 🤝',
+      linkButtonTitle: str(c?.linkButtonTitle, 30) || 'Open the link ⚡',
+      publicReplies: publicReplies.length ? publicReplies : ['check your DMs 👀'],
+    });
+  }
+  return {
+    myHandle: str(input?.myHandle, 40, DEFAULT_CONFIG.myHandle),
+    myProfileUrl: /^https:\/\/(www\.)?instagram\.com\//.test(input?.myProfileUrl || '')
+      ? str(input.myProfileUrl, 120)
+      : DEFAULT_CONFIG.myProfileUrl,
+    btnTitle: str(input?.btnTitle, 30, DEFAULT_CONFIG.btnTitle) || DEFAULT_CONFIG.btnTitle,
+    followBtnTitle: str(input?.followBtnTitle, 30, DEFAULT_CONFIG.followBtnTitle) || DEFAULT_CONFIG.followBtnTitle,
+    gateDm: str(input?.gateDm, 640, DEFAULT_CONFIG.gateDm) || DEFAULT_CONFIG.gateDm,
+    gateNudge: str(input?.gateNudge, 640, DEFAULT_CONFIG.gateNudge) || DEFAULT_CONFIG.gateNudge,
+    campaigns,
+  };
+}
+
+const ADMIN_HTML = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Funnel settings</title>
+<style>
+  :root{--bg:#f5f5f7;--card:#fff;--ink:#0d1117;--muted:#5a6271;--line:#e8e8ec;--accent:#7c3aed}
+  *{box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,'Inter',sans-serif;max-width:760px;margin:32px auto 80px;padding:0 20px;background:var(--bg);color:var(--ink);line-height:1.5}
+  h1{font-size:24px;margin:0 0 4px}.sub{color:var(--muted);font-size:13px;margin-bottom:20px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px;margin-bottom:14px}
+  .card h2{font-size:15px;margin:0 0 12px}
+  label{display:block;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);margin:10px 0 4px}
+  input,textarea{width:100%;padding:9px 11px;border:1px solid var(--line);border-radius:8px;font:inherit;font-size:14px;background:#fafafa}
+  textarea{min-height:64px;resize:vertical}
+  input:focus,textarea:focus{outline:2px solid var(--accent);outline-offset:-1px;background:#fff}
+  .row2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+  .btn{display:inline-block;border:0;border-radius:9px;padding:10px 18px;font-weight:700;font-size:14px;cursor:pointer}
+  .btn-primary{background:var(--accent);color:#fff}.btn-ghost{background:#eee;color:var(--ink)}.btn-danger{background:#fdecec;color:#a02323}
+  .camp{border-left:4px solid var(--accent)}
+  .toolbar{position:sticky;bottom:14px;display:flex;gap:10px;justify-content:flex-end;background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px;box-shadow:0 6px 24px rgba(0,0,0,.08)}
+  #toast{position:fixed;top:16px;left:50%;transform:translateX(-50%);background:#0d1117;color:#fff;padding:10px 18px;border-radius:9px;font-size:14px;display:none;z-index:9}
+  .hint{font-size:12px;color:var(--muted);margin-top:2px}
+  a{color:var(--accent);text-decoration:none}
+</style></head><body>
+<div id="toast"></div>
+<h1>⚙️ Funnel settings</h1>
+<div class="sub">Changes go live within ~15 seconds — no redeploy. <a href="/">← back to dashboard</a></div>
+<div class="card">
+  <h2>🔑 Access</h2>
+  <label>Admin key</label><input id="key" type="password" placeholder="your ADMIN_KEY secret">
+  <div class="hint">Stored only in this browser. Set it on the worker with: npx wrangler secret put ADMIN_KEY</div>
+  <div style="margin-top:10px"><button class="btn btn-primary" onclick="load()">Unlock</button></div>
+</div>
+<div id="form" style="display:none">
+  <div class="card">
+    <h2>👤 Account</h2>
+    <div class="row2"><div><label>Instagram handle</label><input id="myHandle"></div>
+    <div><label>Profile URL</label><input id="myProfileUrl"></div></div>
+    <div class="row2"><div><label>Main button label</label><input id="btnTitle"></div>
+    <div><label>Follow button label</label><input id="followBtnTitle"></div></div>
+  </div>
+  <div class="card">
+    <h2>🔒 Follow-gate messages</h2>
+    <label>Not following yet (first message)</label><textarea id="gateDm"></textarea>
+    <label>Still not following (reminder)</label><textarea id="gateNudge"></textarea>
+  </div>
+  <div id="campaigns"></div>
+  <div style="margin:6px 0 16px"><button class="btn btn-ghost" onclick="addCampaign()">+ Add campaign</button></div>
+  <div class="toolbar"><button class="btn btn-primary" onclick="save()">💾 Save — live in ~15s</button></div>
+</div>
+<script>
+const F = ['name','keyword','link','hookDm','dmTemplate','linkCardText','linkButtonTitle','publicReplies'];
+const LBL = {name:'Campaign name',keyword:'Trigger keyword',link:'Link (https://…)',hookDm:'First DM (with the button — no link in it)',dmTemplate:'Fallback DM text ({link} = the link)',linkCardText:'Final card text',linkButtonTitle:'Link button label',publicReplies:'Public replies (separate with | )'};
+const TA = new Set(['hookDm','dmTemplate','linkCardText','publicReplies']);
+function toast(m){const t=document.getElementById('toast');t.textContent=m;t.style.display='block';setTimeout(()=>t.style.display='none',2600)}
+function campCard(c,i){
+  const el=document.createElement('div');el.className='card camp';el.dataset.i=i;
+  el.innerHTML='<h2>📣 Campaign <button class="btn btn-danger" style="float:right;padding:4px 10px;font-size:12px" onclick="this.closest(\\'.card\\').remove()">delete</button></h2>'+
+    F.map(f=>'<label>'+LBL[f]+'</label>'+(TA.has(f)?'<textarea data-f="'+f+'"></textarea>':'<input data-f="'+f+'">')).join('');
+  F.forEach(f=>{const v=c[f];el.querySelector('[data-f='+f+']').value=Array.isArray(v)?v.join(' | '):(v||'')});
+  return el;
+}
+function addCampaign(){document.getElementById('campaigns').appendChild(campCard({},Date.now()))}
+async function load(){
+  const key=document.getElementById('key').value||localStorage.getItem('adminKey')||'';
+  const r=await fetch('/admin/config',{headers:{'x-admin-key':key}});
+  if(!r.ok){toast(r.status===401?'wrong key':'error '+r.status);return}
+  localStorage.setItem('adminKey',key);
+  const cfg=await r.json();
+  for(const f of ['myHandle','myProfileUrl','btnTitle','followBtnTitle','gateDm','gateNudge'])document.getElementById(f).value=cfg[f]||'';
+  const wrap=document.getElementById('campaigns');wrap.innerHTML='';
+  cfg.campaigns.forEach((c,i)=>wrap.appendChild(campCard(c,i)));
+  document.getElementById('form').style.display='block';
+  toast('loaded ✓');
+}
+async function save(){
+  const out={campaigns:[]};
+  for(const f of ['myHandle','myProfileUrl','btnTitle','followBtnTitle','gateDm','gateNudge'])out[f]=document.getElementById(f).value;
+  document.querySelectorAll('#campaigns .card').forEach(el=>{
+    const c={};F.forEach(f=>c[f]=el.querySelector('[data-f='+f+']').value);
+    c.publicReplies=c.publicReplies.split('|').map(s=>s.trim()).filter(Boolean);
+    out.campaigns.push(c);
+  });
+  const r=await fetch('/admin/config',{method:'POST',headers:{'x-admin-key':localStorage.getItem('adminKey')||'','content-type':'application/json'},body:JSON.stringify(out)});
+  const j=await r.json().catch(()=>({}));
+  toast(r.ok?'saved ✓ live in ~15s':'✗ '+(j.error||('error '+r.status)));
+}
+if(localStorage.getItem('adminKey')){document.getElementById('key').value=localStorage.getItem('adminKey');load()}
+</script></body></html>`;
 
 export default {
   async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
@@ -937,10 +1155,41 @@ export default {
 
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
+    await loadFunnelConfig(env);
     // Manual run for testing: GET /run
     if (url.pathname === '/run') {
       const r = await poll(env);
       return new Response(JSON.stringify(r), { headers: { 'content-type': 'application/json' } });
+    }
+    // Admin UI: edit campaigns, links and copy in the browser (no redeploy).
+    if (url.pathname === '/admin') {
+      return new Response(ADMIN_HTML, { headers: { 'content-type': 'text/html; charset=utf-8' } });
+    }
+    if (url.pathname === '/admin/config') {
+      if (!env.ADMIN_KEY) {
+        return new Response(JSON.stringify({ error: 'ADMIN_KEY not set — run: npx wrangler secret put ADMIN_KEY' }), {
+          status: 503, headers: { 'content-type': 'application/json' },
+        });
+      }
+      if (!adminAuthorized(request, env)) {
+        return new Response(JSON.stringify({ error: 'unauthorized' }), { status: 401, headers: { 'content-type': 'application/json' } });
+      }
+      if (request.method === 'POST') {
+        let body: any;
+        try { body = await request.json(); } catch { body = null; }
+        const cfgOrErr = sanitizeConfig(body);
+        if ('error' in cfgOrErr) {
+          return new Response(JSON.stringify(cfgOrErr), { status: 400, headers: { 'content-type': 'application/json' } });
+        }
+        if (!(await kvPutSafe(env, 'config', JSON.stringify(cfgOrErr)))) {
+          return new Response(JSON.stringify({ error: 'KV write failed (free-plan daily write quota?) — try again after midnight UTC' }), {
+            status: 503, headers: { 'content-type': 'application/json' },
+          });
+        }
+        cfgLoadedAt = 0; // this isolate picks it up immediately; others within 15s
+        return new Response(JSON.stringify({ ok: true }), { headers: { 'content-type': 'application/json' } });
+      }
+      return new Response(JSON.stringify(CFG, null, 2), { headers: { 'content-type': 'application/json' } });
     }
     // Funnel health check: GET /gate-check          → is Graph access working?
     //                      GET /gate-check?igsid=… → live follow check on one user
