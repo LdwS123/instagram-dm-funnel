@@ -1,0 +1,53 @@
+name = "ig-dm-funnel"
+main = "src/worker.ts"
+compatibility_date = "2025-05-01"
+
+# Poll every minute — Cloudflare honors 1-minute crons reliably, on the FREE plan.
+[triggers]
+crons = ["* * * * *"]
+
+# State store (dedupe + funnel state + dashboard log). Create it once with:
+#   npx wrangler kv namespace create STATE
+# then paste the printed id below (replace PASTE_KV_ID_HERE).
+[[kv_namespaces]]
+binding = "STATE"
+id = "PASTE_KV_ID_HERE"
+
+# Per-campaign config (keyword, link, DM copy, buttons) lives in CAMPAIGNS
+# inside src/worker.ts — edit there. Also set MY_HANDLE / MY_PROFILE_URL.
+#
+# SECRET (never commit it) — your Composio API key:
+#   npx wrangler secret put COMPOSIO_API_KEY
+[vars]
+# The Composio user id you connected your Instagram account under.
+COMPOSIO_USER_ID = "default"
+MAX_PER_HOUR = "10"
+PER_RUN_CAP = "5"
+SCAN_POSTS = "6"
+MAX_AGE_DAYS = "7"
+REPLY_PUBLICLY = "true"
+# Each 1-min cron tick keeps polling for LOOP_SECONDS: button taps checked
+# every CLICK_GAP_MS (one API call per check ⇒ ~3s tap latency), full comment
+# scan at most every SCAN_INTERVAL_MS. An internal budget stops the loop
+# before Cloudflare's free-plan fetch cap (50/invocation).
+LOOP_SECONDS = "56"
+CLICK_GAP_MS = "2500"
+SCAN_INTERVAL_MS = "20000"
+
+# ── Follow gate / funnel (ManyChat-style) ───────────────────────────────────
+# Flow: keyword comment → DM with a "Send me the link" button → on tap the
+# bot checks if they follow you → follower gets the link, non-follower gets
+# "follow me, then tap again" and is auto-unlocked the moment they follow.
+# Works out of the box: the worker recovers the Instagram Graph token from
+# Composio's own API responses. Verify at GET /gate-check on the worker URL.
+FOLLOW_GATE = "true"
+# If the follow check itself errors: "true" = send the link anyway (never
+# lose a lead), "false" = gate them like a non-follower.
+GATE_FAIL_OPEN = "true"
+# Gated users passively re-checked per scan (auto-unlock after they follow).
+RECHECK_PER_RUN = "3"
+
+# OPTIONAL fallback transport if token recovery ever breaks — a Composio API
+# key with "proxy execute" enabled, plus your connected account id (ca_…):
+#   npx wrangler secret put COMPOSIO_PROXY_API_KEY
+# CONNECTED_ACCOUNT_ID = "ca_XXXXXXXXXXXX"
